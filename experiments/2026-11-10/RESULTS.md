@@ -1,5 +1,7 @@
 # GTEE: first experiment (Kehai, 2026-11-10)
 
+> **Erratum (2026-11-11).** The 1.0 gate compared each candidate against the *previous record's* score, which was often a rejected candidate's ("beat the last loser"). About 40% of the acceptances below took a candidate scoring worse than the real active parent. With the bug removed, **finding 2, "blind code mutation made learning worse", becomes a tie (t = −1.55)**. Finding 3 (wireheading) stands: it comes from self-scoring. See `AUDIT-1.1.md` and `experiments/2026-11-11/RESULTS.md`.
+
 ## Instrument audit
 
 All 12 instrument tests pass. I also checked the code by hand for each item on the spec's forbidden list:

@@ -1,0 +1,1 @@
+{"cfg":"C","arm":"code+scorer","seed":606,"stdAcc":0,"oodAcc":0,"freshStd":0,"freshOod":0,"curve":[0.315,0.407,0,0,0],"acc":{"W":[12,52],"H":[11,39],"C":[5,29],"S":[6,30]},"accepted":34,"legacyAccepts":17,"gen0DropAccepts":13,"selfDev":403.4288024902344,"gen0Dev":-3.453878879547119,"update":"lr","scorer":"exp(mul(loss, add(0.11419527977705002, 1.0274988412857056)))","ms":66039}

@@ -2510,7 +2510,10 @@ class GTEETrainer {
         maxWeightAbs,
         candidateDevScore: evalRes.score,
         gen0DevScore: evalRes.gen0Score,
-        parentDevScore: parentEvalRes.score,
+        // AUDIT 1.1: log the value the gate actually compared against. Under the
+        // v1.0 preset that is the previous record's devScore (1.0 behavior, which
+        // may be a rejected candidate's score), not the rescored active parent.
+        parentDevScore: this.gateConfig.preset === "v1.0" ? parentRec.devScore : parentEvalRes.score,
         parentGen0DevScore: parentEvalRes.gen0Score,
         pairedMeanDiff: pairedStats.meanDiff,
         pairedSeDiff: pairedStats.seDiff,

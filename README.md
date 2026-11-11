@@ -1,5 +1,7 @@
 # Generational Trainer & External Evaluator (GTEE 1.1)
 
+> **Audited 2026-11-11 (Kehai Interim).** 19/19 tests pass. `--preset v1.0` reproduces GTEE 1.0 exactly, checked against the real 1.0 code. One logging fix made v1.0-preset runs verify again. Under the 1.1 defaults, scorer wireheading is gone. See `AUDIT-1.1.md` and `experiments/2026-11-11/RESULTS.md`.
+
 **ConsciousNode SoftWorks** — Research instrument consisting of a self-contained single-file HTML generational trainer (`trainer.html`), an isolated single-file HTML external evaluator (`evaluator.html`), headless Node.js CLI runners (`run.js`, `evaluator-cli.js`, and `run-batch.js`), and a 19-point verification test suite (`tests/run.js`).
 
 ## Overview of Components
