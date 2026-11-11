@@ -1,13 +1,25 @@
-# GTEE Defaults & Primitive Reference (`DEFAULTS.md`)
+# GTEE 1.1 Defaults & Primitive Reference (`DEFAULTS.md`)
 
-Every default constant, dimension, bound, probability, seed mask, and DSL primitive in the **Generational Trainer & External Evaluator (GTEE)** instrument is documented below with a one-line engineering reason.
+Every default constant, dimension, bound, probability, gate configuration setting, seed mask, and DSL primitive in the **Generational Trainer & External Evaluator (GTEE 1.1)** instrument is documented below with a one-line engineering reason.
 
-## 1. Model Architecture Defaults (`DEFAULT_MODEL_CONFIG`)
+## 1. Gate & Evaluation Configuration Defaults (`gateConfig` — GTEE 1.1)
+
+| Parameter | Default (`--preset default`) | `--preset v1.0` | One-Line Reason |
+|---|---|---|---|
+| `gateScorer` | `"gen0"` | `"genome"` | Evaluates both candidate and parent under the fixed Gen-0 scorer (`sub(acc, mul(0.25, loss))`) by default so gate acceptance compares candidates on a stationary metric while still logging both scorers. |
+| `devSeedsPerFamily` | `16` (`64` total) | `4` (`16` total) | Provides 64 total development samples (16 per task family) per generation so paired standard-error estimates have sufficient degrees of freedom (`df = 63`) while running in `< 150 ms` headless. |
+| `devResample` | `true` | `false` | Draws a fresh 64-sample development batch from the trainer PRNG each generation and evaluates both candidate and parent on that identical batch to prevent overfitting to a static dev seed list. |
+| `gateRule` | `"paired_se"` | `"greater"` | Requires the mean of per-sample paired differences (`cand_i - parent_i`) to exceed `gateK` times its standard error, filtering out noisy zero-mean fluctuations across resampled batches. |
+| `gateK` | `1.0` | `1.0` | Sets a 1.0 standard-error threshold (`meanDiff > 1.0 * seDiff`) balancing sensitivity to genuine step improvements over 18 training steps against sampling variance across 64 tasks. |
+| `gateMargin` | `0.01` | `0.01` | Sets a 1% score improvement floor when `gateRule` is configured to `"margin"` (`candScore - parentScore > 0.01`). |
+| `gateW` | `"gated"` | `"gated"` | Routes train-only (`W`) steps through the same acceptance gate as mutation steps by default unless explicitly set to `"always"`. |
+
+## 2. Model Architecture Defaults (`DEFAULT_MODEL_CONFIG`)
 
 | Parameter | Default | One-Line Reason |
 |---|---|---|
 | `vocabSize` (`V`) | `24` | Accommodates all control tokens (`PAD`, `BOS`, `SEP`, `QRY`, `EOS`), base-4 digits (`0..3`), brackets, keys (`K0..K5`), and grammar rules (`R0..R3`) without wasted embedding rows. |
-| `dim` (`C`) | `12` |Smallest hidden dimension divisible by `headSize = 6` (`H = 2` heads) that completes a multi-step generation in `< 50 ms` headless in Node. |
+| `dim` (`C`) | `12` | Smallest hidden dimension divisible by `headSize = 6` (`H = 2` heads) that completes a 64-sample paired generation in `< 200 ms` headless in Node. |
 | `headSize` (`N`) | `6` | Divides `dim = 12` into `H = 2` matrix-memory heads (`6x6` state per head) so multi-head RWKV-7 recurrence is exercised cleanly. |
 | `numLayers` (`L`) | `2` | Minimum layer count required to exercise both layer-0 base value path and layer-1+ value residual (`vFirst`) path in RWKV-7 (`pips-room.html:1493-1495`). |
 | `dimFFN` (`FF`) | `24` | Standard `2 * dim` channel-mix expansion width matching `pips-room.html:4276`. |
@@ -20,13 +32,13 @@ Every default constant, dimension, bound, probability, seed mask, and DSL primit
 | `group_ln_eps` | `64e-5` | Official RWKV-7 per-head GroupNorm stabilization epsilon lifted from `pips-room.html:1509`. |
 | `kk_norm_eps` | `1e-6` | Minimum L2 norm floor when normalizing per-head key removal vector `kk`. |
 
-## 2. Generation-0 Genome Defaults (`createGen0Genome`)
+## 3. Generation-0 Genome Defaults (`createGen0Genome`)
 
 | Parameter | Default | One-Line Reason |
 |---|---|---|
 | `hyper.lr` | `0.04` | Stable baseline step size for clipped SGD on a 2-layer `dim=12` recurrent network over 18 steps. |
 | `hyper.momentum` | `0.90` | Standard exponential moving average factor for first-moment gradient accumulation buffer `m`. |
-| `hyper.steps` | `18` | Provides enough gradient updates per generation to move loss while keeping headless runtime well under 0.1 seconds per generation. |
+| `hyper.steps` | `18` | Provides enough gradient updates per generation to move loss while keeping headless runtime well under 0.2 seconds per generation. |
 | `hyper.gradClip` | `1.0` | Symmetric elementwise gradient clipping bound `[-1.0, 1.0]` preventing recurrent BPTT spikes. |
 | `hyper.ternaryMix` | `0.20` | Blends 20% TMAC ternary forward activation with 80% dense activation via Straight-Through Estimator at Gen 0. |
 | `hyper.ternaryThreshold` | `0.50` | Matches `Math.round` cutoff (`|w / gamma| >= 0.5`) lifted from `TMAC.quantizeWeights` in `pips-room.html:3943-3946`. |
@@ -35,7 +47,7 @@ Every default constant, dimension, bound, probability, seed mask, and DSL primit
 | `scorer` (Gen 0) | `sub(acc, mul(0.25, loss))` | Fixed linear combination (`acc - 0.25 * loss`) rewarding higher accuracy and lower cross-entropy loss. |
 | `beta2` (variance EMA) | `0.99` | Standard second-moment squared gradient exponential moving average factor for variance buffer `v`. |
 
-## 3. Hyperparameter Mutation Bounds & Symmetric Noise Scales (`HYPER_BOUNDS`)
+## 4. Hyperparameter Mutation Bounds & Symmetric Noise Scales (`HYPER_BOUNDS`)
 
 | Hyperparameter | Min | Max | Symmetric Noise Half-Width (`±scale`) | One-Line Reason |
 |---|---|---|---|---|
@@ -47,7 +59,7 @@ Every default constant, dimension, bound, probability, seed mask, and DSL primit
 | `ternaryThreshold` | `0.15` | `0.85` | `±0.10` | Avoids degenerate all-nonzero (`< 0.15`) or all-zero (`> 0.85`) ternary quantization deadzones. |
 | `curriculumWeight` | `0.05` | `0.85` | `±0.10` | Ensures all 4 task families retain positive sampling probability prior to simplex normalization. |
 
-## 4. Operator Selection Weights & Arms (`DEFAULT_OPERATOR_WEIGHTS`)
+## 5. Operator Selection Weights & Arms (`DEFAULT_OPERATOR_WEIGHTS`)
 
 | Operator | Default Base Weight | One-Line Reason |
 |---|---|---|
@@ -58,7 +70,7 @@ Every default constant, dimension, bound, probability, seed mask, and DSL primit
 
 When an arm (`train`, `hyper`, `code`, `code+scorer`) restricts the active operator subset, active base weights are normalized by their sum so that setting any disabled operator's weight to `0` produces identical normalized probabilities across matching arms.
 
-## 5. AST DSL Primitive Set (`PRIMITIVE_SPECS`)
+## 6. AST DSL Primitive Set (`PRIMITIVE_SPECS`)
 
 The random expression generator samples uniformly over all 16 primitives below:
 
@@ -87,15 +99,14 @@ The random expression generator samples uniformly over all 16 primitives below:
 - **AST node budget (`AST_MAX_NODES`):** `256` maximum nodes (`64` soft mutation cap, `32` max depth) to guarantee bounded evaluation time and prevent stack overflow.
 - **AST mutation sub-operators (`AST_MUTATION_OPS`):** `const_perturb`, `subtree_replace`, `wrap_primitive`, `arg_swap`, `ancestor_splice` (each chosen uniformly with probability `1/5 = 0.20`).
 
-## 6. Tasks, Seeds, and Gate Thresholds
+## 7. Tasks, Seeds, and Safety Thresholds
 
 | Constant | Default | One-Line Reason |
 |---|---|---|
 | `TRAINER_DOMAIN_MASK` | `0x7FFFFFFF` | Clears bit 31 on all trainer seeds so trainer seeds strictly inhabit `[0, 2^31 - 1]`. |
 | `EVALUATOR_DOMAIN_BIT` | `0x80000000` | Sets bit 31 on all evaluator seeds so evaluator seeds strictly inhabit `[2^31, 2^32 - 1]`, guaranteeing zero domain overlap. |
-| `EVALUATOR_SECRET_SEED_KEY` | `0xE7A15EED` | Fixed seed derivation key present exclusively in `evaluator.html` and `evaluator-cli.js`. |
-| `devSeedsPerFamily` (Trainer) | `4` (16 total) | Evaluates 4 seeds across each of the 4 task families per generation for fast, balanced dev scoring. |
-| `evalSeedsPerFamily` (Evaluator) | `6` (24 std + 24 OOD) | Evaluates 6 seeds per family in both standard and long-length settings for external grading. |
+| `EVALUATOR_SECRET_SEED_KEY` | `0xE7A15EED` | Fixed primary seed derivation key present exclusively in `evaluator.html` and `evaluator-cli.js`. |
+| `evalSeedsPerFamily` (Evaluator) | `6` (`24` std + `24` OOD) | Evaluates 6 seeds per family in both standard and long-length settings for external grading. |
 | `carry_add` lengths | `2` digits (std), `4` digits (long) | Tests causal carry propagation across double the training digit length in OOD evaluation. |
 | `brackets` lengths | `3` steps (std), `6` steps (long) | Tests Dyck-2 LIFO stack completion at double the standard nesting depth in OOD evaluation. |
 | `kv_recall` lengths | `3` pairs / `1` query (std), `5` pairs / `2` queries (long) | Tests associative memory capacity over longer context and multiple queries in OOD evaluation. |

@@ -2,8 +2,8 @@
 'use strict';
 
 // ============================================================================
-// GTEE Headless External Evaluator CLI (evaluator-cli.js)
-// Usage: node evaluator-cli.js <descendant.html> [--out eval.json]
+// GTEE 1.1 Headless External Evaluator CLI (evaluator-cli.js)
+// Usage: node evaluator-cli.js <descendant.html> [--evaluator-key <hex>] [--out eval.json]
 // ============================================================================
 
 const fs = require('fs');
@@ -336,14 +336,82 @@ function base64ToBytes(b64) {
   return out;
 }
 
+// ── Gate Configuration & Presets (GTEE 1.1 §1) ──────────────────────────────
+const GATE_PRESETS = Object.freeze({
+  'default': Object.freeze({
+    preset: 'default',
+    gateScorer: 'gen0',
+    devSeedsPerFamily: 16,
+    devResample: true,
+    gateRule: 'paired_se',
+    gateK: f32(1.0),
+    gateMargin: f32(0.01),
+    gateW: 'gated'
+  }),
+  'v1.0': Object.freeze({
+    preset: 'v1.0',
+    gateScorer: 'genome',
+    devSeedsPerFamily: 4,
+    devResample: false,
+    gateRule: 'greater',
+    gateK: f32(1.0),
+    gateMargin: f32(0.01),
+    gateW: 'gated'
+  })
+});
+
+function resolveGateConfig(opts = {}) {
+  const presetName = (opts && opts.preset) ? String(opts.preset) : 'default';
+  const base = GATE_PRESETS[presetName] || GATE_PRESETS['default'];
+  const cfg = {
+    preset: presetName,
+    gateScorer: opts.gateScorer !== undefined ? String(opts.gateScorer) : base.gateScorer,
+    devSeedsPerFamily: opts.devSeedsPerFamily !== undefined ? (opts.devSeedsPerFamily | 0) : base.devSeedsPerFamily,
+    devResample: opts.devResample !== undefined ? Boolean(opts.devResample) : base.devResample,
+    gateRule: opts.gateRule !== undefined ? String(opts.gateRule) : base.gateRule,
+    gateK: opts.gateK !== undefined ? f32(opts.gateK) : f32(base.gateK),
+    gateMargin: opts.gateMargin !== undefined ? f32(opts.gateMargin) : f32(base.gateMargin),
+    gateW: opts.gateW !== undefined ? String(opts.gateW) : base.gateW
+  };
+  validateGateConfig(cfg);
+  return cfg;
+}
+
+function validateGateConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object') throw new Error('gateConfig must be an object');
+  if (cfg.gateScorer !== 'gen0' && cfg.gateScorer !== 'genome') {
+    throw new Error(`Invalid gateScorer: ${cfg.gateScorer}`);
+  }
+  if (!Number.isInteger(cfg.devSeedsPerFamily) || cfg.devSeedsPerFamily < 1 || cfg.devSeedsPerFamily > 256) {
+    throw new Error(`Invalid devSeedsPerFamily: ${cfg.devSeedsPerFamily}`);
+  }
+  if (typeof cfg.devResample !== 'boolean') {
+    throw new Error(`Invalid devResample: ${cfg.devResample}`);
+  }
+  if (cfg.gateRule !== 'greater' && cfg.gateRule !== 'margin' && cfg.gateRule !== 'paired_se') {
+    throw new Error(`Invalid gateRule: ${cfg.gateRule}`);
+  }
+  if (typeof cfg.gateK !== 'number' || !Number.isFinite(cfg.gateK) || cfg.gateK < 0) {
+    throw new Error(`Invalid gateK: ${cfg.gateK}`);
+  }
+  if (typeof cfg.gateMargin !== 'number' || !Number.isFinite(cfg.gateMargin)) {
+    throw new Error(`Invalid gateMargin: ${cfg.gateMargin}`);
+  }
+  if (cfg.gateW !== 'gated' && cfg.gateW !== 'always') {
+    throw new Error(`Invalid gateW: ${cfg.gateW}`);
+  }
+  return true;
+}
+
+function computeGateConfigSig(gateConfig, rootSeed) {
+  return sha256Bytes('GTEE_GATE_CFG_V11:' + canonicalJSON(gateConfig) + ':' + String(rootSeed >>> 0));
+}
+
 // ----------------------------------------------------------------------------
 // 2. PROVENANCE: TERNARY QUANTIZATION & RWKV-7 ENGINE LIFTED FROM pips-room.html
 // ----------------------------------------------------------------------------
 
 // [PROVENANCE: Lifted from pips-room.html lines 3915-3983 (class TMAC)]
-// Modifications for GTEE:
-// 1. Replaced native float arithmetic with Math.fround (f32) for cross-engine bit-identity.
-// 2. Added configurable thresholdFactor (default 0.5, matching Math.round) in quantizeWeights.
 class TMAC {
   static UNPACK_TABLE = new Int8Array(81 * 4);
 
@@ -437,8 +505,6 @@ class TMAC {
 TMAC.initTable();
 
 // [PROVENANCE: Lifted from pips-room.html lines 3985-4041 (class BitLinear)]
-// Modifications for GTEE:
-// 1. Uses seeded DeterministicPRNG and detSqrt instead of Math.random / Math.sqrt.
 class BitLinear {
   constructor(inDim, outDim, rng = new DeterministicPRNG(1)) {
     this.inDim = inDim;
@@ -499,12 +565,6 @@ class BitLinear {
 }
 
 // [PROVENANCE: Lifted from pips-room.html lines 1342-1648 (class RWKV7 "Goose" x070)]
-// Canonical source in pips-room.html: HTMLNLM/engine/rwkv7-engine.js (BlinkDL rwkv7 math + exact BPTT).
-// Modifications for GTEE:
-// 1. Replaced Math.exp, Math.tanh, Math.sqrt, Math.random with deterministic Float32 equivalents
-//    (detExp, detTanh, detSqrt, detSigmoid, and seeded DeterministicPRNG).
-// 2. Integrated TMAC ternary quantization (lifted from pips-room.html:3915-3983) into _lin()
-//    controlled by model.ternaryMix and model.ternaryThreshold via Straight-Through Estimator (STE).
 const SIG = detSigmoid;
 const W_SCALE = f32(0.606531); // exp(-0.5), official constant (pips-room.html:1343)
 
@@ -539,8 +599,8 @@ class RWKV7 {
     this.p = {};
     this.shape = {};
     this.g = {};
-    this.m = {}; // Momentum buffer per parameter tensor
-    this.v = {}; // Variance buffer per parameter tensor
+    this.m = {};
+    this.v = {};
     this.paramOrder = [];
 
     const def = (name, shape, init) => {
@@ -1404,7 +1464,7 @@ function evalAST(node, env) {
 }
 
 // ----------------------------------------------------------------------------
-// 5. GENOME DEFAULTS, EVALUATION, AND HASHING
+// 5. GENOME DEFAULTS, EVALUATION, PAIRED STATS, AND HASHING
 // ----------------------------------------------------------------------------
 function createGen0UpdateRule() {
   return {
@@ -1511,6 +1571,7 @@ function softmaxProbs(logits) {
   return probs;
 }
 
+// Evaluate model on samples and also return per-sample scores under both genome scorer and gen-0 scorer
 function evaluateModelOnSamples(model, samples, scorerAST) {
   let totalTargets = 0;
   let totalCorrect = 0;
@@ -1521,12 +1582,19 @@ function evaluateModelOnSamples(model, samples, scorerAST) {
     { correct: 0, total: 0, loss: f32(0) },
     { correct: 0, total: 0, loss: f32(0) }
   ];
+  const gen0AST = createGen0Scorer();
+  const activeAST = scorerAST || gen0AST;
+  const sampleGenomeScores = new Float32Array(samples.length);
+  const sampleGen0Scores = new Float32Array(samples.length);
 
   for (let s = 0; s < samples.length; s++) {
     const sample = samples[s];
     const toks = sample.tokens;
     const mask = sample.mask;
     let state = model.getEmptyState();
+    let sTargets = 0;
+    let sCorrect = 0;
+    let sLoss = f32(0);
     for (let t = 0; t < toks.length - 1; t++) {
       const res = model.forward(toks[t], state);
       state = res.state;
@@ -1547,17 +1615,23 @@ function evaluateModelOnSamples(model, samples, scorerAST) {
         totalTargets++;
         totalCorrect += hit;
         totalLoss = f32(totalLoss + stepLoss);
+        sTargets++;
+        sCorrect += hit;
+        sLoss = f32(sLoss + stepLoss);
         const fs = famStats[sample.familyIndex];
         fs.total++;
         fs.correct += hit;
         fs.loss = f32(fs.loss + stepLoss);
       }
     }
+    const sAcc = sTargets > 0 ? f32(sCorrect / sTargets) : f32(0);
+    const sMeanLoss = sTargets > 0 ? f32(sLoss / sTargets) : f32(0);
+    sampleGenomeScores[s] = evalAST(activeAST, { acc: sAcc, loss: sMeanLoss });
+    sampleGen0Scores[s] = evalAST(gen0AST, { acc: sAcc, loss: sMeanLoss });
   }
 
   const acc = totalTargets > 0 ? f32(totalCorrect / totalTargets) : f32(0);
   const loss = totalTargets > 0 ? f32(totalLoss / totalTargets) : f32(0);
-  const gen0AST = createGen0Scorer();
   const gen0Score = evalAST(gen0AST, { acc, loss });
   const score = scorerAST ? evalAST(scorerAST, { acc, loss }) : gen0Score;
 
@@ -1573,10 +1647,131 @@ function evaluateModelOnSamples(model, samples, scorerAST) {
     };
   }
 
-  return { acc, loss, score, gen0Score, perFamily };
+  return {
+    acc,
+    loss,
+    score,
+    gen0Score,
+    genomeMinusGen0Score: f32(score - gen0Score),
+    sampleGenomeScores,
+    sampleGen0Scores,
+    perFamily
+  };
 }
 
-function computeRecordHash(record) {
+// Compute paired difference mean and standard error across M samples
+function computePairedStats(candSampleScores, parentSampleScores) {
+  const M = candSampleScores.length;
+  if (M === 0 || parentSampleScores.length !== M) {
+    return { count: 0, meanDiff: f32(0), seDiff: f32(0) };
+  }
+  const diffs = new Float32Array(M);
+  let sum = f32(0);
+  for (let i = 0; i < M; i++) {
+    const d = f32(f32(candSampleScores[i]) - f32(parentSampleScores[i]));
+    diffs[i] = d;
+    sum = f32(sum + d);
+  }
+  const meanDiff = f32(sum / f32(M));
+  if (M <= 1) {
+    return { count: M, meanDiff, seDiff: f32(0) };
+  }
+  let sqSum = f32(0);
+  for (let i = 0; i < M; i++) {
+    const dev = f32(diffs[i] - meanDiff);
+    sqSum = f32(sqSum + f32(dev * dev));
+  }
+  const variance = f32(sqSum / f32(M - 1));
+  const seDiff = f32(detSqrt(f32(variance / f32(M))));
+  return { count: M, meanDiff, seDiff };
+}
+
+// Configurable Gate Evaluation (§1 & §4 Test 14, 16)
+function evaluateGate({
+  isGen0,
+  operator = 'W',
+  gateConfig = GATE_PRESETS['default'],
+  hasNaNOrInf,
+  totalStepAbsSum,
+  totalGradAbsSum,
+  maxStepAbs,
+  maxWeightAbs,
+  candidateDevScore,
+  gen0DevScore,
+  parentDevScore,
+  parentGen0DevScore,
+  candSampleScores,
+  parentSampleScores
+}) {
+  // 1. Safety checks always run first (even for W under gateW="always")
+  if (maxStepAbs > f32(50.0) || maxWeightAbs > f32(100.0)) {
+    return { accepted: false, reason: 'reject_explosive_step' };
+  }
+  if (hasNaNOrInf || !Number.isFinite(candidateDevScore) || !Number.isFinite(gen0DevScore)) {
+    return { accepted: false, reason: 'reject_nan_or_inf' };
+  }
+  if (totalGradAbsSum > f32(1e-8) && totalStepAbsSum <= f32(1e-9)) {
+    return { accepted: false, reason: 'reject_zero_step' };
+  }
+  if (isGen0) {
+    return { accepted: true, reason: 'accept_gen0_baseline' };
+  }
+
+  const cfg = gateConfig || GATE_PRESETS['default'];
+
+  // 2. Check gateW="always" for W (train-only) steps
+  if (operator === 'W' && cfg.gateW === 'always') {
+    return { accepted: true, reason: 'accept_w_always' };
+  }
+
+  // 3. Determine active gate scores under gateScorer ("gen0" vs "genome")
+  const candScore = cfg.gateScorer === 'gen0' ? f32(gen0DevScore) : f32(candidateDevScore);
+  const parScore = cfg.gateScorer === 'gen0'
+    ? f32(parentGen0DevScore !== undefined ? parentGen0DevScore : parentDevScore)
+    : f32(parentDevScore);
+
+  if (!Number.isFinite(candScore) || !Number.isFinite(parScore)) {
+    return { accepted: false, reason: 'reject_nan_or_inf' };
+  }
+
+  // 4. Apply gateRule ("greater", "margin", or "paired_se")
+  if (cfg.gateRule === 'greater') {
+    if (candScore > parScore) {
+      return { accepted: true, reason: 'accept_improved_dev_score' };
+    }
+    return { accepted: false, reason: 'reject_score_not_beaten' };
+  }
+
+  if (cfg.gateRule === 'margin') {
+    const diff = f32(candScore - parScore);
+    if (diff > f32(cfg.gateMargin)) {
+      return { accepted: true, reason: 'accept_improved_dev_score' };
+    }
+    return { accepted: false, reason: 'reject_score_not_beaten' };
+  }
+
+  if (cfg.gateRule === 'paired_se') {
+    let meanDiff, seDiff;
+    if (candSampleScores && parentSampleScores && candSampleScores.length > 0) {
+      const ps = computePairedStats(candSampleScores, parentSampleScores);
+      meanDiff = ps.meanDiff;
+      seDiff = ps.seDiff;
+    } else {
+      meanDiff = f32(candScore - parScore);
+      seDiff = f32(0);
+    }
+    const threshold = f32(f32(cfg.gateK) * seDiff);
+    if (meanDiff > f32(0) && meanDiff > threshold) {
+      return { accepted: true, reason: 'accept_improved_dev_score' };
+    }
+    return { accepted: false, reason: 'reject_score_not_beaten' };
+  }
+
+  throw new Error(`Unknown gateRule: ${cfg.gateRule}`);
+}
+
+// Compute recordHash (includes gateConfig when present on Gen 0; excluding gateConfig reproduces exact v1.0 hashes)
+function computeRecordHash(record, omitGateConfig = false) {
   const canonicalPayload = {
     seqIndex: record.seqIndex,
     gen: record.gen,
@@ -1602,28 +1797,49 @@ function computeRecordHash(record) {
     candidateWeightsHash: record.candidateWeightsHash,
     weightsHash: record.weightsHash
   };
+  if (!omitGateConfig && record.gateConfig !== undefined) {
+    canonicalPayload.gateConfig = record.gateConfig;
+  }
   return sha256Bytes(canonicalJSON(canonicalPayload));
 }
 
+// Recompute the v1.0 recordHash chain (omitting gateConfig from record 0) for Test 13 verification
+function computeV10RecordHashChain(lineage) {
+  const hashes = [];
+  for (let i = 0; i < lineage.length; i++) {
+    const recCopy = Object.assign({}, lineage[i]);
+    if (i === 0) {
+      recCopy.parentHash = '0'.repeat(64);
+    } else {
+      recCopy.parentHash = hashes[recCopy.parentSeqIndex];
+    }
+    hashes.push(computeRecordHash(recCopy, true));
+  }
+  return hashes;
+}
 
-// ── Evaluator Isolated Seed Key & Seed Derivation (§7) ──────────────────────
+
+// ── Evaluator Isolated Seed Key & Seed Derivation (§7 & 1.1 §3) ─────────────
 const EVALUATOR_SECRET_SEED_KEY = 0xE7A15EED;
 const EVALUATOR_DOMAIN_BIT = 0x80000000;
 
-function deriveEvaluatorSeed(index, isLong = false) {
-  const mix = (EVALUATOR_SECRET_SEED_KEY ^ Math.imul((index + 1) | 0, isLong ? 0x85ebca6b : 0xc2b2ae35)) >>> 0;
+function deriveEvaluatorSeed(index, isLong = false, customEvaluatorKey = null) {
+  const key = (customEvaluatorKey !== null && customEvaluatorKey !== undefined)
+    ? (customEvaluatorKey >>> 0)
+    : EVALUATOR_SECRET_SEED_KEY;
+  const mix = (key ^ Math.imul((index + 1) | 0, isLong ? 0x85ebca6b : 0xc2b2ae35)) >>> 0;
   const rng = new DeterministicPRNG(mix);
   return ((rng.nextUint32() | EVALUATOR_DOMAIN_BIT) >>> 0);
 }
 
-function buildEvaluatorTaskSuite(samplesPerFamily = 6) {
+function buildEvaluatorTaskSuite(samplesPerFamily = 6, customEvaluatorKey = null) {
   const standardSamples = [];
   const longSamples = [];
   let idx = 0;
   for (let fam = 0; fam < 4; fam++) {
     for (let i = 0; i < samplesPerFamily; i++) {
-      const sStd = deriveEvaluatorSeed(idx, false);
-      const sLong = deriveEvaluatorSeed(idx, true);
+      const sStd = deriveEvaluatorSeed(idx, false, customEvaluatorKey);
+      const sLong = deriveEvaluatorSeed(idx, true, customEvaluatorKey);
       standardSamples.push(generateTaskSample(fam, sStd, false));
       longSamples.push(generateTaskSample(fam, sLong, true));
       idx++;
@@ -1654,9 +1870,9 @@ function parseDescendantWithoutExecution(rawInput) {
   return JSON.parse(jsonSlice);
 }
 
-// ── Lineage & Tamper Verification (§7) ──────────────────────────────────────
+// ── Lineage & Tamper Verification (§7 & 1.1 §2) ─────────────────────────────
 // Rejects tampering with exact reason:
-// 'forged_gen0', 'reordering', 'genome', 'spliced_branch', 'record', or 'weights'
+// 'reordering', 'gate_config', 'forged_gen0', 'genome', 'spliced_branch', 'record', or 'weights'
 function verifyAndEvaluateDescendant(rawInput, opts = {}) {
   let bundle;
   try {
@@ -1706,8 +1922,92 @@ function verifyAndEvaluateDescendant(rawInput, opts = {}) {
     }
   }
 
-  // 2. Check Forged Gen 0 on lineage[0]
   const rec0 = lineage[0];
+  const rootSeed = (bundle.rootSeed >>> 0);
+
+  // 2. Check Gate Config Integrity (GTEE 1.1 §2: 'gate_config')
+  const gateCfg = rec0.gateConfig;
+  try {
+    validateGateConfig(gateCfg);
+  } catch (e) {
+    return {
+      valid: false,
+      tamperReason: 'gate_config',
+      error: `Invalid or missing gateConfig in Gen 0 record: ${e.message}`
+    };
+  }
+  if (bundle.gateConfig !== undefined && canonicalJSON(bundle.gateConfig) !== canonicalJSON(gateCfg)) {
+    return {
+      valid: false,
+      tamperReason: 'gate_config',
+      error: 'Top-level bundle.gateConfig does not match Gen 0 recorded gateConfig'
+    };
+  }
+  if (rec0.gateConfigSig !== computeGateConfigSig(gateCfg, rootSeed)) {
+    return {
+      valid: false,
+      tamperReason: 'gate_config',
+      error: 'Gen 0 gateConfig was modified (gateConfigSig mismatch)'
+    };
+  }
+  const expectedDevLen = gateCfg.devSeedsPerFamily * 4;
+  for (let i = 0; i < lineage.length; i++) {
+    const rec = lineage[i];
+    if (!rec.seeds || !Array.isArray(rec.seeds.dev) || rec.seeds.dev.length !== expectedDevLen) {
+      return {
+        valid: false,
+        tamperReason: 'gate_config',
+        error: `Record ${i} dev seeds length (${rec.seeds?.dev?.length}) does not match gateConfig.devSeedsPerFamily*4 (${expectedDevLen})`
+      };
+    }
+    if (!gateCfg.devResample && i > 0) {
+      if (canonicalJSON(rec.seeds.dev) !== canonicalJSON(rec0.seeds.dev)) {
+        return {
+          valid: false,
+          tamperReason: 'gate_config',
+          error: `Record ${i} resampled dev seeds while gateConfig.devResample is false`
+        };
+      }
+    }
+    if (i > 0 && rec.gateStats) {
+      const gs = rec.gateStats;
+      const reGate = evaluateGate({
+        isGen0: false,
+        operator: rec.operator,
+        gateConfig: gateCfg,
+        hasNaNOrInf: gs.hasNaNOrInf,
+        totalStepAbsSum: gs.totalStepAbsSum,
+        totalGradAbsSum: gs.totalGradAbsSum,
+        maxStepAbs: gs.maxStepAbs,
+        maxWeightAbs: gs.maxWeightAbs,
+        candidateDevScore: gs.candidateDevScore === null ? NaN : gs.candidateDevScore,
+        gen0DevScore: gs.gen0DevScore === null ? NaN : gs.gen0DevScore,
+        parentDevScore: gs.parentDevScore,
+        parentGen0DevScore: gs.parentGen0DevScore,
+        candSampleScores: null,
+        parentSampleScores: null
+      });
+      // For paired_se, check directly with recorded pairedMeanDiff and pairedSeDiff
+      if (gateCfg.gateRule === 'paired_se' && !(rec.operator === 'W' && gateCfg.gateW === 'always') && !gs.hasNaNOrInf && gs.maxStepAbs <= f32(50.0) && gs.maxWeightAbs <= f32(100.0) && !(gs.totalGradAbsSum > f32(1e-8) && gs.totalStepAbsSum <= f32(1e-9))) {
+        const expectedAcc = gs.pairedMeanDiff > f32(0) && gs.pairedMeanDiff > f32(f32(gateCfg.gateK) * gs.pairedSeDiff);
+        if (rec.accepted !== expectedAcc) {
+          return {
+            valid: false,
+            tamperReason: 'gate_config',
+            error: `Record ${i} accepted=${rec.accepted} contradicts gateConfig paired_se rule`
+          };
+        }
+      } else if (reGate.accepted !== rec.accepted) {
+        return {
+          valid: false,
+          tamperReason: 'gate_config',
+          error: `Record ${i} accepted=${rec.accepted} contradicts gateConfig (${gateCfg.gateRule} / ${gateCfg.gateScorer} / ${gateCfg.gateW})`
+        };
+      }
+    }
+  }
+
+  // 3. Check Forged Gen 0 on lineage[0]
   const canonicalGen0 = createGen0Genome();
   if (
     rec0.gen !== 0 ||
@@ -1727,7 +2027,6 @@ function verifyAndEvaluateDescendant(rawInput, opts = {}) {
     };
   }
 
-  const rootSeed = (bundle.rootSeed >>> 0);
   if ((rootSeed & 0x80000000) !== 0) {
     return {
       valid: false,
@@ -1824,7 +2123,7 @@ function verifyAndEvaluateDescendant(rawInput, opts = {}) {
     };
   }
 
-  // 3. Check Genome Integrity on all records (AST validity, genomeHash, genomeDiff, activeGenome rule)
+  // 4. Check Genome Integrity on all records (AST validity, genomeHash, genomeDiff, activeGenome rule)
   for (let i = 0; i < lineage.length; i++) {
     const rec = lineage[i];
     try {
@@ -1899,7 +2198,7 @@ function verifyAndEvaluateDescendant(rawInput, opts = {}) {
     }
   }
 
-  // 4. Check Spliced Branch across all records
+  // 5. Check Spliced Branch across all records
   const knownBranches = new Set(['main']);
   const branchTips = { main: 0 };
   for (let i = 1; i < lineage.length; i++) {
@@ -1948,7 +2247,7 @@ function verifyAndEvaluateDescendant(rawInput, opts = {}) {
     }
   }
 
-  // 5. Check Record Hash Integrity on all records
+  // 6. Check Record Hash Integrity on all records
   for (let i = 0; i < lineage.length; i++) {
     const rec = lineage[i];
     const expectedRecordHash = computeRecordHash(rec);
@@ -1961,7 +2260,7 @@ function verifyAndEvaluateDescendant(rawInput, opts = {}) {
     }
   }
 
-  // 6. Check Weights Integrity on all records AND top-level bundle.weightsB64
+  // 7. Check Weights Integrity on all records AND top-level bundle.weightsB64
   const checkModel = new RWKV7(modelCfg, { seed: rootSeed });
   for (let i = 0; i < lineage.length; i++) {
     const rec = lineage[i];
@@ -2017,9 +2316,10 @@ function verifyAndEvaluateDescendant(rawInput, opts = {}) {
     };
   }
 
-  // 7. Score EVERY generation in the lineage on Evaluator's Standard (in-distribution)
-  //    and Long (out-of-distribution) task suites using the Gen-0 scorer ONLY (§7)
-  const suite = buildEvaluatorTaskSuite(opts.samplesPerFamily || 6);
+  // 8. Score EVERY generation in the lineage on Evaluator's Standard (in-distribution)
+  //    and Long (out-of-distribution) task suites using the Gen-0 scorer ONLY (§7 & 1.1 §2)
+  const customKey = opts.evaluatorKey !== undefined ? opts.evaluatorKey : null;
+  const suite = buildEvaluatorTaskSuite(opts.samplesPerFamily || 6, customKey);
   const gen0Scorer = createGen0Scorer();
   const generationsReport = [];
 
@@ -2031,6 +2331,7 @@ function verifyAndEvaluateDescendant(rawInput, opts = {}) {
 
     const stdEval = evaluateModelOnSamples(checkModel, suite.standardSamples, gen0Scorer);
     const longEval = evaluateModelOnSamples(checkModel, suite.longSamples, gen0Scorer);
+    const genomeMinusGen0 = f32(rec.devScore - rec.gen0DevScore);
 
     generationsReport.push({
       seqIndex: rec.seqIndex,
@@ -2038,11 +2339,14 @@ function verifyAndEvaluateDescendant(rawInput, opts = {}) {
       branchId: rec.branchId,
       operator: rec.operator,
       accepted: rec.accepted,
+      gateReason: rec.gateReason,
       weightsHash: rec.weightsHash,
       recordHash: rec.recordHash,
+      genomeMinusGen0DevScore: genomeMinusGen0,
       trainerReported: {
         devScoreGenomeScorer: rec.devScore,
         devScoreGen0Scorer: rec.gen0DevScore,
+        genomeMinusGen0DevScore: genomeMinusGen0,
         devAcc: rec.devAcc,
         devLoss: rec.devLoss
       },
@@ -2067,6 +2371,7 @@ function verifyAndEvaluateDescendant(rawInput, opts = {}) {
     tamperReason: null,
     rootSeed: bundle.rootSeed,
     arm: bundle.arm,
+    gateConfig: gateCfg,
     totalRecords: lineage.length,
     activeSeqIndex: activeIdx,
     generations: generationsReport
@@ -2074,21 +2379,32 @@ function verifyAndEvaluateDescendant(rawInput, opts = {}) {
 }
 
 
+function parseEvalKey(str) {
+  if (str === undefined || str === null) return null;
+  const clean = String(str).trim().replace(/^0x/i, '');
+  const val = parseInt(clean, 16);
+  if (Number.isNaN(val)) throw new Error(`Invalid hex --evaluator-key: ${str}`);
+  return val >>> 0;
+}
+
 function runCLI() {
   const args = process.argv.slice(2);
   if (args.length === 0 || args.includes('--help') || args.includes('-h')) {
-    console.error('Usage: node evaluator-cli.js <descendant.html> [--out <file.json>]');
+    console.error('Usage: node evaluator-cli.js <descendant.html> [--evaluator-key <hex>] [--out <file.json>]');
     process.exit(1);
   }
   const inputPath = args[0];
   let outPath = null;
+  let evaluatorKey = null;
   for (let i = 1; i < args.length; i++) {
     if (args[i] === '--out' && args[i + 1]) {
       outPath = args[++i];
+    } else if (args[i] === '--evaluator-key' && args[i + 1]) {
+      evaluatorKey = parseEvalKey(args[++i]);
     }
   }
   const raw = fs.readFileSync(path.resolve(inputPath), 'utf8');
-  const report = verifyAndEvaluateDescendant(raw);
+  const report = verifyAndEvaluateDescendant(raw, { evaluatorKey });
   const jsonText = JSON.stringify(report, null, 2);
   if (outPath) {
     fs.mkdirSync(path.dirname(path.resolve(outPath)), { recursive: true });
@@ -2115,6 +2431,10 @@ module.exports = {
   DeterministicPRNG,
   sha256Bytes,
   canonicalJSON,
+  GATE_PRESETS,
+  resolveGateConfig,
+  validateGateConfig,
+  computeGateConfigSig,
   TMAC,
   BitLinear,
   RWKV7,
@@ -2133,8 +2453,12 @@ module.exports = {
   createGen0Scorer,
   createGen0Genome,
   evaluateModelOnSamples,
+  computePairedStats,
+  evaluateGate,
   computeRecordHash,
+  computeV10RecordHashChain,
   EVALUATOR_SECRET_SEED_KEY,
+  parseEvalKey,
   deriveEvaluatorSeed,
   buildEvaluatorTaskSuite,
   parseDescendantWithoutExecution,

@@ -2,8 +2,8 @@
 'use strict';
 
 // ============================================================================
-// GTEE Headless Generational Runner (run.js)
-// Usage: node run.js --arm <arm> --gens <N> --seed <uint32> --out <dir>
+// GTEE 1.1 Headless Generational Runner (run.js)
+// Usage: node run.js --arm <arm> --gens <N> --seed <uint32> [--preset <default|v1.0>] [gate flags] --out <dir>
 // ============================================================================
 
 const fs = require('fs');
@@ -336,14 +336,82 @@ function base64ToBytes(b64) {
   return out;
 }
 
+// ── Gate Configuration & Presets (GTEE 1.1 §1) ──────────────────────────────
+const GATE_PRESETS = Object.freeze({
+  'default': Object.freeze({
+    preset: 'default',
+    gateScorer: 'gen0',
+    devSeedsPerFamily: 16,
+    devResample: true,
+    gateRule: 'paired_se',
+    gateK: f32(1.0),
+    gateMargin: f32(0.01),
+    gateW: 'gated'
+  }),
+  'v1.0': Object.freeze({
+    preset: 'v1.0',
+    gateScorer: 'genome',
+    devSeedsPerFamily: 4,
+    devResample: false,
+    gateRule: 'greater',
+    gateK: f32(1.0),
+    gateMargin: f32(0.01),
+    gateW: 'gated'
+  })
+});
+
+function resolveGateConfig(opts = {}) {
+  const presetName = (opts && opts.preset) ? String(opts.preset) : 'default';
+  const base = GATE_PRESETS[presetName] || GATE_PRESETS['default'];
+  const cfg = {
+    preset: presetName,
+    gateScorer: opts.gateScorer !== undefined ? String(opts.gateScorer) : base.gateScorer,
+    devSeedsPerFamily: opts.devSeedsPerFamily !== undefined ? (opts.devSeedsPerFamily | 0) : base.devSeedsPerFamily,
+    devResample: opts.devResample !== undefined ? Boolean(opts.devResample) : base.devResample,
+    gateRule: opts.gateRule !== undefined ? String(opts.gateRule) : base.gateRule,
+    gateK: opts.gateK !== undefined ? f32(opts.gateK) : f32(base.gateK),
+    gateMargin: opts.gateMargin !== undefined ? f32(opts.gateMargin) : f32(base.gateMargin),
+    gateW: opts.gateW !== undefined ? String(opts.gateW) : base.gateW
+  };
+  validateGateConfig(cfg);
+  return cfg;
+}
+
+function validateGateConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object') throw new Error('gateConfig must be an object');
+  if (cfg.gateScorer !== 'gen0' && cfg.gateScorer !== 'genome') {
+    throw new Error(`Invalid gateScorer: ${cfg.gateScorer}`);
+  }
+  if (!Number.isInteger(cfg.devSeedsPerFamily) || cfg.devSeedsPerFamily < 1 || cfg.devSeedsPerFamily > 256) {
+    throw new Error(`Invalid devSeedsPerFamily: ${cfg.devSeedsPerFamily}`);
+  }
+  if (typeof cfg.devResample !== 'boolean') {
+    throw new Error(`Invalid devResample: ${cfg.devResample}`);
+  }
+  if (cfg.gateRule !== 'greater' && cfg.gateRule !== 'margin' && cfg.gateRule !== 'paired_se') {
+    throw new Error(`Invalid gateRule: ${cfg.gateRule}`);
+  }
+  if (typeof cfg.gateK !== 'number' || !Number.isFinite(cfg.gateK) || cfg.gateK < 0) {
+    throw new Error(`Invalid gateK: ${cfg.gateK}`);
+  }
+  if (typeof cfg.gateMargin !== 'number' || !Number.isFinite(cfg.gateMargin)) {
+    throw new Error(`Invalid gateMargin: ${cfg.gateMargin}`);
+  }
+  if (cfg.gateW !== 'gated' && cfg.gateW !== 'always') {
+    throw new Error(`Invalid gateW: ${cfg.gateW}`);
+  }
+  return true;
+}
+
+function computeGateConfigSig(gateConfig, rootSeed) {
+  return sha256Bytes('GTEE_GATE_CFG_V11:' + canonicalJSON(gateConfig) + ':' + String(rootSeed >>> 0));
+}
+
 // ----------------------------------------------------------------------------
 // 2. PROVENANCE: TERNARY QUANTIZATION & RWKV-7 ENGINE LIFTED FROM pips-room.html
 // ----------------------------------------------------------------------------
 
 // [PROVENANCE: Lifted from pips-room.html lines 3915-3983 (class TMAC)]
-// Modifications for GTEE:
-// 1. Replaced native float arithmetic with Math.fround (f32) for cross-engine bit-identity.
-// 2. Added configurable thresholdFactor (default 0.5, matching Math.round) in quantizeWeights.
 class TMAC {
   static UNPACK_TABLE = new Int8Array(81 * 4);
 
@@ -437,8 +505,6 @@ class TMAC {
 TMAC.initTable();
 
 // [PROVENANCE: Lifted from pips-room.html lines 3985-4041 (class BitLinear)]
-// Modifications for GTEE:
-// 1. Uses seeded DeterministicPRNG and detSqrt instead of Math.random / Math.sqrt.
 class BitLinear {
   constructor(inDim, outDim, rng = new DeterministicPRNG(1)) {
     this.inDim = inDim;
@@ -499,12 +565,6 @@ class BitLinear {
 }
 
 // [PROVENANCE: Lifted from pips-room.html lines 1342-1648 (class RWKV7 "Goose" x070)]
-// Canonical source in pips-room.html: HTMLNLM/engine/rwkv7-engine.js (BlinkDL rwkv7 math + exact BPTT).
-// Modifications for GTEE:
-// 1. Replaced Math.exp, Math.tanh, Math.sqrt, Math.random with deterministic Float32 equivalents
-//    (detExp, detTanh, detSqrt, detSigmoid, and seeded DeterministicPRNG).
-// 2. Integrated TMAC ternary quantization (lifted from pips-room.html:3915-3983) into _lin()
-//    controlled by model.ternaryMix and model.ternaryThreshold via Straight-Through Estimator (STE).
 const SIG = detSigmoid;
 const W_SCALE = f32(0.606531); // exp(-0.5), official constant (pips-room.html:1343)
 
@@ -539,8 +599,8 @@ class RWKV7 {
     this.p = {};
     this.shape = {};
     this.g = {};
-    this.m = {}; // Momentum buffer per parameter tensor
-    this.v = {}; // Variance buffer per parameter tensor
+    this.m = {};
+    this.v = {};
     this.paramOrder = [];
 
     const def = (name, shape, init) => {
@@ -1404,7 +1464,7 @@ function evalAST(node, env) {
 }
 
 // ----------------------------------------------------------------------------
-// 5. GENOME DEFAULTS, EVALUATION, AND HASHING
+// 5. GENOME DEFAULTS, EVALUATION, PAIRED STATS, AND HASHING
 // ----------------------------------------------------------------------------
 function createGen0UpdateRule() {
   return {
@@ -1511,6 +1571,7 @@ function softmaxProbs(logits) {
   return probs;
 }
 
+// Evaluate model on samples and also return per-sample scores under both genome scorer and gen-0 scorer
 function evaluateModelOnSamples(model, samples, scorerAST) {
   let totalTargets = 0;
   let totalCorrect = 0;
@@ -1521,12 +1582,19 @@ function evaluateModelOnSamples(model, samples, scorerAST) {
     { correct: 0, total: 0, loss: f32(0) },
     { correct: 0, total: 0, loss: f32(0) }
   ];
+  const gen0AST = createGen0Scorer();
+  const activeAST = scorerAST || gen0AST;
+  const sampleGenomeScores = new Float32Array(samples.length);
+  const sampleGen0Scores = new Float32Array(samples.length);
 
   for (let s = 0; s < samples.length; s++) {
     const sample = samples[s];
     const toks = sample.tokens;
     const mask = sample.mask;
     let state = model.getEmptyState();
+    let sTargets = 0;
+    let sCorrect = 0;
+    let sLoss = f32(0);
     for (let t = 0; t < toks.length - 1; t++) {
       const res = model.forward(toks[t], state);
       state = res.state;
@@ -1547,17 +1615,23 @@ function evaluateModelOnSamples(model, samples, scorerAST) {
         totalTargets++;
         totalCorrect += hit;
         totalLoss = f32(totalLoss + stepLoss);
+        sTargets++;
+        sCorrect += hit;
+        sLoss = f32(sLoss + stepLoss);
         const fs = famStats[sample.familyIndex];
         fs.total++;
         fs.correct += hit;
         fs.loss = f32(fs.loss + stepLoss);
       }
     }
+    const sAcc = sTargets > 0 ? f32(sCorrect / sTargets) : f32(0);
+    const sMeanLoss = sTargets > 0 ? f32(sLoss / sTargets) : f32(0);
+    sampleGenomeScores[s] = evalAST(activeAST, { acc: sAcc, loss: sMeanLoss });
+    sampleGen0Scores[s] = evalAST(gen0AST, { acc: sAcc, loss: sMeanLoss });
   }
 
   const acc = totalTargets > 0 ? f32(totalCorrect / totalTargets) : f32(0);
   const loss = totalTargets > 0 ? f32(totalLoss / totalTargets) : f32(0);
-  const gen0AST = createGen0Scorer();
   const gen0Score = evalAST(gen0AST, { acc, loss });
   const score = scorerAST ? evalAST(scorerAST, { acc, loss }) : gen0Score;
 
@@ -1573,10 +1647,131 @@ function evaluateModelOnSamples(model, samples, scorerAST) {
     };
   }
 
-  return { acc, loss, score, gen0Score, perFamily };
+  return {
+    acc,
+    loss,
+    score,
+    gen0Score,
+    genomeMinusGen0Score: f32(score - gen0Score),
+    sampleGenomeScores,
+    sampleGen0Scores,
+    perFamily
+  };
 }
 
-function computeRecordHash(record) {
+// Compute paired difference mean and standard error across M samples
+function computePairedStats(candSampleScores, parentSampleScores) {
+  const M = candSampleScores.length;
+  if (M === 0 || parentSampleScores.length !== M) {
+    return { count: 0, meanDiff: f32(0), seDiff: f32(0) };
+  }
+  const diffs = new Float32Array(M);
+  let sum = f32(0);
+  for (let i = 0; i < M; i++) {
+    const d = f32(f32(candSampleScores[i]) - f32(parentSampleScores[i]));
+    diffs[i] = d;
+    sum = f32(sum + d);
+  }
+  const meanDiff = f32(sum / f32(M));
+  if (M <= 1) {
+    return { count: M, meanDiff, seDiff: f32(0) };
+  }
+  let sqSum = f32(0);
+  for (let i = 0; i < M; i++) {
+    const dev = f32(diffs[i] - meanDiff);
+    sqSum = f32(sqSum + f32(dev * dev));
+  }
+  const variance = f32(sqSum / f32(M - 1));
+  const seDiff = f32(detSqrt(f32(variance / f32(M))));
+  return { count: M, meanDiff, seDiff };
+}
+
+// Configurable Gate Evaluation (§1 & §4 Test 14, 16)
+function evaluateGate({
+  isGen0,
+  operator = 'W',
+  gateConfig = GATE_PRESETS['default'],
+  hasNaNOrInf,
+  totalStepAbsSum,
+  totalGradAbsSum,
+  maxStepAbs,
+  maxWeightAbs,
+  candidateDevScore,
+  gen0DevScore,
+  parentDevScore,
+  parentGen0DevScore,
+  candSampleScores,
+  parentSampleScores
+}) {
+  // 1. Safety checks always run first (even for W under gateW="always")
+  if (maxStepAbs > f32(50.0) || maxWeightAbs > f32(100.0)) {
+    return { accepted: false, reason: 'reject_explosive_step' };
+  }
+  if (hasNaNOrInf || !Number.isFinite(candidateDevScore) || !Number.isFinite(gen0DevScore)) {
+    return { accepted: false, reason: 'reject_nan_or_inf' };
+  }
+  if (totalGradAbsSum > f32(1e-8) && totalStepAbsSum <= f32(1e-9)) {
+    return { accepted: false, reason: 'reject_zero_step' };
+  }
+  if (isGen0) {
+    return { accepted: true, reason: 'accept_gen0_baseline' };
+  }
+
+  const cfg = gateConfig || GATE_PRESETS['default'];
+
+  // 2. Check gateW="always" for W (train-only) steps
+  if (operator === 'W' && cfg.gateW === 'always') {
+    return { accepted: true, reason: 'accept_w_always' };
+  }
+
+  // 3. Determine active gate scores under gateScorer ("gen0" vs "genome")
+  const candScore = cfg.gateScorer === 'gen0' ? f32(gen0DevScore) : f32(candidateDevScore);
+  const parScore = cfg.gateScorer === 'gen0'
+    ? f32(parentGen0DevScore !== undefined ? parentGen0DevScore : parentDevScore)
+    : f32(parentDevScore);
+
+  if (!Number.isFinite(candScore) || !Number.isFinite(parScore)) {
+    return { accepted: false, reason: 'reject_nan_or_inf' };
+  }
+
+  // 4. Apply gateRule ("greater", "margin", or "paired_se")
+  if (cfg.gateRule === 'greater') {
+    if (candScore > parScore) {
+      return { accepted: true, reason: 'accept_improved_dev_score' };
+    }
+    return { accepted: false, reason: 'reject_score_not_beaten' };
+  }
+
+  if (cfg.gateRule === 'margin') {
+    const diff = f32(candScore - parScore);
+    if (diff > f32(cfg.gateMargin)) {
+      return { accepted: true, reason: 'accept_improved_dev_score' };
+    }
+    return { accepted: false, reason: 'reject_score_not_beaten' };
+  }
+
+  if (cfg.gateRule === 'paired_se') {
+    let meanDiff, seDiff;
+    if (candSampleScores && parentSampleScores && candSampleScores.length > 0) {
+      const ps = computePairedStats(candSampleScores, parentSampleScores);
+      meanDiff = ps.meanDiff;
+      seDiff = ps.seDiff;
+    } else {
+      meanDiff = f32(candScore - parScore);
+      seDiff = f32(0);
+    }
+    const threshold = f32(f32(cfg.gateK) * seDiff);
+    if (meanDiff > f32(0) && meanDiff > threshold) {
+      return { accepted: true, reason: 'accept_improved_dev_score' };
+    }
+    return { accepted: false, reason: 'reject_score_not_beaten' };
+  }
+
+  throw new Error(`Unknown gateRule: ${cfg.gateRule}`);
+}
+
+// Compute recordHash (includes gateConfig when present on Gen 0; excluding gateConfig reproduces exact v1.0 hashes)
+function computeRecordHash(record, omitGateConfig = false) {
   const canonicalPayload = {
     seqIndex: record.seqIndex,
     gen: record.gen,
@@ -1602,7 +1797,25 @@ function computeRecordHash(record) {
     candidateWeightsHash: record.candidateWeightsHash,
     weightsHash: record.weightsHash
   };
+  if (!omitGateConfig && record.gateConfig !== undefined) {
+    canonicalPayload.gateConfig = record.gateConfig;
+  }
   return sha256Bytes(canonicalJSON(canonicalPayload));
+}
+
+// Recompute the v1.0 recordHash chain (omitting gateConfig from record 0) for Test 13 verification
+function computeV10RecordHashChain(lineage) {
+  const hashes = [];
+  for (let i = 0; i < lineage.length; i++) {
+    const recCopy = Object.assign({}, lineage[i]);
+    if (i === 0) {
+      recCopy.parentHash = '0'.repeat(64);
+    } else {
+      recCopy.parentHash = hashes[recCopy.parentSeqIndex];
+    }
+    hashes.push(computeRecordHash(recCopy, true));
+  }
+  return hashes;
 }
 
 
@@ -1615,6 +1828,17 @@ function deriveTrainerSeed(rawUint32) {
 
 function deriveTrainerDevSeeds(rootSeed, countPerFamily = 4) {
   const rng = new DeterministicPRNG(((rootSeed >>> 0) ^ 0x243f6a88) >>> 0);
+  const devSeeds = [];
+  for (let fam = 0; fam < 4; fam++) {
+    for (let i = 0; i < countPerFamily; i++) {
+      const s = deriveTrainerSeed(rng.nextUint32());
+      devSeeds.push({ familyIndex: fam, seed: s });
+    }
+  }
+  return devSeeds;
+}
+
+function drawResampledDevSeeds(rng, countPerFamily = 16) {
   const devSeeds = [];
   for (let fam = 0; fam < 4; fam++) {
     for (let i = 0; i < countPerFamily; i++) {
@@ -1997,48 +2221,22 @@ function sampleCurriculumFamily(rng, curriculum) {
   return 3;
 }
 
-// Gate evaluation rule (§3.5 & §9.10)
-function evaluateGate({
-  isGen0,
-  hasNaNOrInf,
-  totalStepAbsSum,
-  totalGradAbsSum,
-  maxStepAbs,
-  maxWeightAbs,
-  candidateDevScore,
-  gen0DevScore,
-  parentDevScore
-}) {
-  if (maxStepAbs > f32(50.0) || maxWeightAbs > f32(100.0)) {
-    return { accepted: false, reason: 'reject_explosive_step' };
-  }
-  if (hasNaNOrInf || !Number.isFinite(candidateDevScore) || !Number.isFinite(gen0DevScore)) {
-    return { accepted: false, reason: 'reject_nan_or_inf' };
-  }
-  if (totalGradAbsSum > f32(1e-8) && totalStepAbsSum <= f32(1e-9)) {
-    return { accepted: false, reason: 'reject_zero_step' };
-  }
-  if (isGen0) {
-    return { accepted: true, reason: 'accept_gen0_baseline' };
-  }
-  if (candidateDevScore > parentDevScore) {
-    return { accepted: true, reason: 'accept_improved_dev_score' };
-  }
-  return { accepted: false, reason: 'reject_score_not_beaten' };
-}
-
-// ── Generational Trainer Session ────────────────────────────────────────────
+// ── Generational Trainer Session (GTEE 1.1) ─────────────────────────────────
 class GTEETrainer {
   constructor(opts = {}) {
     this.rootSeed = deriveTrainerSeed(opts.seed !== undefined ? opts.seed : 42);
     this.arm = opts.arm || 'train';
     this.customOperatorWeights = opts.operatorWeights || null;
     this.modelConfig = Object.assign({}, DEFAULT_MODEL_CONFIG, opts.modelConfig || {});
-    this.devSeedSpecs = deriveTrainerDevSeeds(this.rootSeed, 4);
-    this.devSamples = this.devSeedSpecs.map(sp => generateTaskSample(sp.familyIndex, sp.seed, false));
+    this.gateConfig = resolveGateConfig(opts.gateConfig || opts);
+
+    // Fixed dev seeds used when gateConfig.devResample === false
+    this.fixedDevSeedSpecs = deriveTrainerDevSeeds(this.rootSeed, this.gateConfig.devSeedsPerFamily);
+    this.fixedDevSamples = this.fixedDevSeedSpecs.map(sp => generateTaskSample(sp.familyIndex, sp.seed, false));
 
     this.rng = new DeterministicPRNG(this.rootSeed);
     this.model = new RWKV7(this.modelConfig, { rng: this.rng });
+    this.parentEvalModel = new RWKV7(this.modelConfig, { seed: 1 });
     this.lineage = [];
     this.activeSeqIndex = -1;
     this.branchCounter = 0;
@@ -2072,11 +2270,21 @@ class GTEETrainer {
       if (st.maxWeightAbs > maxWeightAbs) maxWeightAbs = st.maxWeightAbs;
     }
 
-    const evalRes = evaluateModelOnSamples(this.model, this.devSamples, gen0Genome.scorer);
+    let devSeedSpecs, devSamples;
+    if (this.gateConfig.devResample) {
+      devSeedSpecs = drawResampledDevSeeds(this.rng, this.gateConfig.devSeedsPerFamily);
+      devSamples = devSeedSpecs.map(sp => generateTaskSample(sp.familyIndex, sp.seed, false));
+    } else {
+      devSeedSpecs = this.fixedDevSeedSpecs;
+      devSamples = this.fixedDevSamples;
+    }
+
+    const evalRes = evaluateModelOnSamples(this.model, devSamples, gen0Genome.scorer);
     const weightsHash = this.model.weightsHash();
     const weightsB64 = this.model.weightsToBase64();
     const bufs = this.model.exportBuffersFlat();
     const elapsedMs = Math.max(1, Date.now() - t0);
+    const gateConfigObj = Object.assign({}, this.gateConfig);
 
     const record = {
       seqIndex: 0,
@@ -2088,18 +2296,21 @@ class GTEETrainer {
       parentHash: '0'.repeat(64),
       operator: 'INIT',
       operatorDetail: 'gen0_clipped_sgd',
+      gateConfig: gateConfigObj,
+      gateConfigSig: computeGateConfigSig(gateConfigObj, this.rootSeed),
       genomeDiff: {},
       candidateGenome: cloneGenome(gen0Genome),
       activeGenome: cloneGenome(gen0Genome),
       genomeHash: computeGenomeHash(gen0Genome),
       seeds: {
         train: trainSeeds,
-        dev: this.devSeedSpecs
+        dev: devSeedSpecs
       },
       devAcc: evalRes.acc,
       devLoss: evalRes.loss,
       devScore: evalRes.score,
       gen0DevScore: evalRes.gen0Score,
+      genomeMinusGen0DevScore: f32(evalRes.score - evalRes.gen0Score),
       accepted: true,
       gateReason: 'accept_gen0_baseline',
       activeGen: 0,
@@ -2141,14 +2352,17 @@ class GTEETrainer {
     const parentBuffers = this.model.exportBuffersFlat();
     const rngBefore = this.rng.getState();
 
+    // 1. Choose one change operator according to configured arm (§4)
     const operator = opts.forcedOperator || selectOperator(this.rng, this.arm, this.customOperatorWeights);
 
+    // 2. Apply operator to parent's genome
     const ancestorChain = this.getAncestorRecords(parentSeqIndex);
     const ancestorGenomes = ancestorChain.map(r => r.activeGenome);
     const mutRes = applyChangeOperator(operator, parentGenome, this.rng, ancestorGenomes);
     const candidateGenome = opts.injectedGenome ? cloneGenome(opts.injectedGenome) : mutRes.genome;
     const operatorDetail = opts.injectedGenome ? 'injected_rule' : mutRes.detail;
 
+    // 3. Train for the candidate genome's step count
     const trainSeeds = [];
     let hasNaNOrInf = false;
     let totalStepAbsSum = f32(0);
@@ -2169,16 +2383,58 @@ class GTEETrainer {
       if (st.maxWeightAbs > maxWeightAbs) maxWeightAbs = st.maxWeightAbs;
     }
 
-    let evalRes;
-    if (hasNaNOrInf) {
-      evalRes = { acc: f32(0), loss: f32(99.0), score: NaN, gen0Score: NaN };
+    // 4. Determine dev batch for this generation (fixed vs paired resampled)
+    let devSeedSpecs, devSamples;
+    if (this.gateConfig.devResample) {
+      devSeedSpecs = drawResampledDevSeeds(this.rng, this.gateConfig.devSeedsPerFamily);
+      devSamples = devSeedSpecs.map(sp => generateTaskSample(sp.familyIndex, sp.seed, false));
     } else {
-      evalRes = evaluateModelOnSamples(this.model, this.devSamples, candidateGenome.scorer);
+      devSeedSpecs = this.fixedDevSeedSpecs;
+      devSamples = this.fixedDevSamples;
     }
+
+    // Evaluate both candidate and parent on the exact same devSamples batch
+    let evalRes, parentEvalRes;
+    if (hasNaNOrInf) {
+      evalRes = {
+        acc: f32(0),
+        loss: f32(99.0),
+        score: NaN,
+        gen0Score: NaN,
+        sampleGenomeScores: new Float32Array(devSamples.length),
+        sampleGen0Scores: new Float32Array(devSamples.length)
+      };
+      parentEvalRes = {
+        acc: parentRec.devAcc,
+        loss: parentRec.devLoss,
+        score: parentRec.devScore,
+        gen0Score: parentRec.gen0DevScore,
+        sampleGenomeScores: new Float32Array(devSamples.length),
+        sampleGen0Scores: new Float32Array(devSamples.length)
+      };
+    } else {
+      evalRes = evaluateModelOnSamples(this.model, devSamples, candidateGenome.scorer);
+      this.parentEvalModel.importWeightsFlat(parentWeightsFlat);
+      this.parentEvalModel.ternaryMix = f32(parentGenome.hyper.ternaryMix);
+      this.parentEvalModel.ternaryThreshold = f32(parentGenome.hyper.ternaryThreshold);
+      parentEvalRes = evaluateModelOnSamples(this.parentEvalModel, devSamples, parentGenome.scorer);
+    }
+
     const candidateWeightsHash = hasNaNOrInf ? 'invalid_nan_weights' : this.model.weightsHash();
 
+    const candSampleScores = this.gateConfig.gateScorer === 'gen0'
+      ? evalRes.sampleGen0Scores
+      : evalRes.sampleGenomeScores;
+    const parentSampleScores = this.gateConfig.gateScorer === 'gen0'
+      ? parentEvalRes.sampleGen0Scores
+      : parentEvalRes.sampleGenomeScores;
+    const pairedStats = computePairedStats(candSampleScores, parentSampleScores);
+
+    // 5. Accept or reject with the gate under this.gateConfig
     const gate = evaluateGate({
       isGen0: false,
+      operator,
+      gateConfig: this.gateConfig,
       hasNaNOrInf,
       totalStepAbsSum,
       totalGradAbsSum,
@@ -2186,7 +2442,10 @@ class GTEETrainer {
       maxWeightAbs,
       candidateDevScore: evalRes.score,
       gen0DevScore: evalRes.gen0Score,
-      parentDevScore: parentRec.devScore
+      parentDevScore: this.gateConfig.preset === "v1.0" ? parentRec.devScore : parentEvalRes.score,
+      parentGen0DevScore: parentEvalRes.gen0Score,
+      candSampleScores,
+      parentSampleScores
     });
 
     let activeGenome, activeGen, weightsHash;
@@ -2210,6 +2469,8 @@ class GTEETrainer {
     const isForkRoot = !!this.pendingFork;
     this.pendingFork = false;
     const elapsedMs = Math.max(1, Date.now() - t0);
+    const recDevScore = Number.isFinite(evalRes.score) ? evalRes.score : f32(-999.0);
+    const recGen0Score = Number.isFinite(evalRes.gen0Score) ? evalRes.gen0Score : f32(-999.0);
 
     const record = {
       seqIndex,
@@ -2227,12 +2488,34 @@ class GTEETrainer {
       genomeHash: computeGenomeHash(candidateGenome),
       seeds: {
         train: trainSeeds,
-        dev: this.devSeedSpecs
+        dev: devSeedSpecs
       },
       devAcc: Number.isFinite(evalRes.acc) ? evalRes.acc : f32(0),
       devLoss: Number.isFinite(evalRes.loss) ? evalRes.loss : f32(99.0),
-      devScore: Number.isFinite(evalRes.score) ? evalRes.score : f32(-999.0),
-      gen0DevScore: Number.isFinite(evalRes.gen0Score) ? evalRes.gen0Score : f32(-999.0),
+      devScore: recDevScore,
+      gen0DevScore: recGen0Score,
+      genomeMinusGen0DevScore: f32(recDevScore - recGen0Score),
+      parentBatchDevScore: Number.isFinite(parentEvalRes.score) ? parentEvalRes.score : f32(-999.0),
+      parentBatchGen0DevScore: Number.isFinite(parentEvalRes.gen0Score) ? parentEvalRes.gen0Score : f32(-999.0),
+      pairedStats: {
+        count: pairedStats.count,
+        meanDiff: pairedStats.meanDiff,
+        seDiff: pairedStats.seDiff
+      },
+      gateStats: {
+        hasNaNOrInf,
+        totalStepAbsSum,
+        totalGradAbsSum,
+        maxStepAbs,
+        maxWeightAbs,
+        candidateDevScore: evalRes.score,
+        gen0DevScore: evalRes.gen0Score,
+        parentDevScore: parentEvalRes.score,
+        parentGen0DevScore: parentEvalRes.gen0Score,
+        pairedMeanDiff: pairedStats.meanDiff,
+        pairedSeDiff: pairedStats.seDiff,
+        pairedCount: pairedStats.count
+      },
       accepted: gate.accepted,
       gateReason: gate.reason,
       activeGen,
@@ -2252,6 +2535,7 @@ class GTEETrainer {
     return record;
   }
 
+  // Rewind: rebuilds any generation k from gen 0 plus the records (including resampled dev seeds)
   rewindTo(targetSeqIndex) {
     if (targetSeqIndex < 0 || targetSeqIndex >= this.lineage.length) {
       throw new Error(`Invalid rewind targetSeqIndex: ${targetSeqIndex}`);
@@ -2263,31 +2547,49 @@ class GTEETrainer {
 
     const replayRng = new DeterministicPRNG(this.rootSeed);
     const replayModel = new RWKV7(this.modelConfig, { rng: replayRng });
+    const cfg = this.gateConfig;
 
+    // Replay Gen 0
     const rec0 = chain[0];
     replayRng.setState(rec0.rngStateBefore);
     const gen0Genome = cloneGenome(rec0.candidateGenome);
     for (let s = 0; s < rec0.seeds.train.length; s++) {
-      const ts = rec0.seeds.train[s];
-      const sample = generateTaskSample(ts.familyIndex, ts.seed, false);
+      const fam = sampleCurriculumFamily(replayRng, gen0Genome.hyper.curriculum);
+      const stepSeed = deriveTrainerSeed(replayRng.nextUint32());
+      const sample = generateTaskSample(fam, stepSeed, false);
       trainOneStep(replayModel, sample, gen0Genome);
     }
+    let rebuiltDevSeeds = cfg.devResample
+      ? drawResampledDevSeeds(replayRng, cfg.devSeedsPerFamily)
+      : this.fixedDevSeedSpecs;
 
     let activeGenome = cloneGenome(rec0.activeGenome);
 
     for (let idx = 1; idx < chain.length; idx++) {
       const rec = chain[idx];
+      replayRng.setState(rec.rngStateBefore);
+      // Advance replayRng through operator selection and genome mutation
+      const op = selectOperator(replayRng, this.arm, this.customOperatorWeights);
+      const ancGenomes = chain.slice(0, idx).map(r => r.activeGenome);
+      applyChangeOperator(op, activeGenome, replayRng, ancGenomes);
+
       const parentWeights = replayModel.exportWeightsFlat();
       const parentBufs = replayModel.exportBuffersFlat();
       const candGenome = cloneGenome(rec.candidateGenome);
 
       let hasNaN = false;
       for (let s = 0; s < rec.seeds.train.length; s++) {
+        sampleCurriculumFamily(replayRng, candGenome.hyper.curriculum);
+        deriveTrainerSeed(replayRng.nextUint32());
         const ts = rec.seeds.train[s];
         const sample = generateTaskSample(ts.familyIndex, ts.seed, false);
         const st = trainOneStep(replayModel, sample, candGenome);
         if (st.hasNaNOrInf) hasNaN = true;
       }
+
+      rebuiltDevSeeds = cfg.devResample
+        ? drawResampledDevSeeds(replayRng, cfg.devSeedsPerFamily)
+        : this.fixedDevSeedSpecs;
 
       if (rec.accepted && !hasNaN) {
         activeGenome = cloneGenome(candGenome);
@@ -2302,6 +2604,7 @@ class GTEETrainer {
     const targetRec = chain[chain.length - 1];
     const rebuiltWeightsHash = replayModel.weightsHash();
     const rebuiltGenomeHash = computeGenomeHash(targetRec.candidateGenome);
+    const devSeedsMatch = canonicalJSON(rebuiltDevSeeds) === canonicalJSON(targetRec.seeds.dev);
 
     this.model = replayModel;
     this.rng.setState(targetRec.rngStateAfter);
@@ -2317,7 +2620,9 @@ class GTEETrainer {
       storedWeightsHash: targetRec.weightsHash,
       genomeHash: rebuiltGenomeHash,
       storedGenomeHash: targetRec.genomeHash,
-      matches: rebuiltWeightsHash === targetRec.weightsHash && rebuiltGenomeHash === targetRec.genomeHash
+      rebuiltDevSeeds,
+      devSeedsMatch,
+      matches: rebuiltWeightsHash === targetRec.weightsHash && rebuiltGenomeHash === targetRec.genomeHash && devSeedsMatch
     };
   }
 
@@ -2350,6 +2655,7 @@ class GTEETrainer {
       format: 'GTEE_DESCENDANT_V1',
       rootSeed: this.rootSeed,
       arm: this.arm,
+      gateConfig: Object.assign({}, this.gateConfig),
       modelConfig: this.modelConfig,
       activeSeqIndex: this.activeSeqIndex,
       activeBranchId: this.activeBranchId,
@@ -2368,8 +2674,10 @@ class GTEETrainer {
     this.rootSeed = bundle.rootSeed >>> 0;
     this.arm = bundle.arm || 'train';
     this.modelConfig = Object.assign({}, DEFAULT_MODEL_CONFIG, bundle.modelConfig || {});
-    this.devSeedSpecs = deriveTrainerDevSeeds(this.rootSeed, 4);
-    this.devSamples = this.devSeedSpecs.map(sp => generateTaskSample(sp.familyIndex, sp.seed, false));
+    const rawGateCfg = (bundle.lineage && bundle.lineage[0] && bundle.lineage[0].gateConfig) || bundle.gateConfig || GATE_PRESETS['default'];
+    this.gateConfig = resolveGateConfig(rawGateCfg);
+    this.fixedDevSeedSpecs = deriveTrainerDevSeeds(this.rootSeed, this.gateConfig.devSeedsPerFamily);
+    this.fixedDevSamples = this.fixedDevSeedSpecs.map(sp => generateTaskSample(sp.familyIndex, sp.seed, false));
     this.lineage = bundle.lineage.map(r => Object.assign({}, r));
     this.activeSeqIndex = bundle.activeSeqIndex;
     this.activeBranchId = bundle.activeBranchId || 'main';
@@ -2396,11 +2704,20 @@ function exportDescendantHTML(templateHTML, stateBundle) {
 }
 
 
+function parseBool(v) {
+  if (typeof v === 'boolean') return v;
+  const s = String(v).toLowerCase().trim();
+  if (s === 'true' || s === '1' || s === 'yes') return true;
+  if (s === 'false' || s === '0' || s === 'no') return false;
+  throw new Error(`Invalid boolean flag value: ${v}`);
+}
+
 function parseArgs(argv) {
   const opts = {
     arm: 'train',
     gens: 3,
     seed: 42,
+    preset: 'default',
     out: './out'
   };
   for (let i = 0; i < argv.length; i++) {
@@ -2408,6 +2725,14 @@ function parseArgs(argv) {
     if (a === '--arm' && argv[i + 1]) opts.arm = argv[++i];
     else if ((a === '--gens' || a === '--generations') && argv[i + 1]) opts.gens = parseInt(argv[++i], 10);
     else if (a === '--seed' && argv[i + 1]) opts.seed = parseInt(argv[++i], 10) >>> 0;
+    else if (a === '--preset' && argv[i + 1]) opts.preset = argv[++i];
+    else if (a === '--gate-scorer' && argv[i + 1]) opts.gateScorer = argv[++i];
+    else if (a === '--dev-seeds-per-family' && argv[i + 1]) opts.devSeedsPerFamily = parseInt(argv[++i], 10);
+    else if (a === '--dev-resample' && argv[i + 1]) opts.devResample = parseBool(argv[++i]);
+    else if (a === '--gate-rule' && argv[i + 1]) opts.gateRule = argv[++i];
+    else if (a === '--gate-k' && argv[i + 1]) opts.gateK = parseFloat(argv[++i]);
+    else if (a === '--gate-margin' && argv[i + 1]) opts.gateMargin = parseFloat(argv[++i]);
+    else if (a === '--gate-w' && argv[i + 1]) opts.gateW = argv[++i];
     else if (a === '--out' && argv[i + 1]) opts.out = argv[++i];
   }
   return opts;
@@ -2426,10 +2751,12 @@ function findTrainerTemplate() {
 }
 
 function runHeadless(opts) {
+  const gateConfig = resolveGateConfig(opts.gateConfig || opts);
   const trainer = new GTEETrainer({
     seed: opts.seed,
     arm: opts.arm,
-    operatorWeights: opts.operatorWeights || null
+    operatorWeights: opts.operatorWeights || null,
+    gateConfig
   });
   trainer.initGen0();
   for (let g = 0; g < opts.gens; g++) {
@@ -2474,10 +2801,12 @@ if (require.main === module) {
     status: 'ok',
     arm: opts.arm,
     seed: trainer.rootSeed,
+    gateConfig: trainer.gateConfig,
     generationsRun: opts.gens,
     totalRecords: trainer.lineage.length,
     finalDevScore: last.devScore,
     finalGen0DevScore: last.gen0DevScore,
+    finalGenomeMinusGen0DevScore: last.genomeMinusGen0DevScore,
     finalWeightsHash: last.weightsHash,
     elapsedMs: elapsed,
     out: opts.out
@@ -2497,6 +2826,10 @@ module.exports = {
   canonicalJSON,
   bytesToBase64,
   base64ToBytes,
+  GATE_PRESETS,
+  resolveGateConfig,
+  validateGateConfig,
+  computeGateConfigSig,
   TMAC,
   BitLinear,
   RWKV7,
@@ -2523,10 +2856,13 @@ module.exports = {
   computeGenomeHash,
   computeGenomeDiff,
   evaluateModelOnSamples,
+  computePairedStats,
   computeRecordHash,
+  computeV10RecordHashChain,
   TRAINER_DOMAIN_MASK,
   deriveTrainerSeed,
   deriveTrainerDevSeeds,
+  drawResampledDevSeeds,
   HYPER_BOUNDS,
   mutateHyperparameters,
   DEFAULT_OPERATOR_WEIGHTS,
@@ -2538,5 +2874,6 @@ module.exports = {
   evaluateGate,
   GTEETrainer,
   exportDescendantHTML,
+  parseArgs,
   runHeadless
 };
